@@ -1,0 +1,322 @@
+---
+- name: Full xCAT installation and compute provisioning on AlmaLinux 8.9
+  hosts: localhost
+  become: true
+
+  vars_prompt:
+    - name: master_ip
+      prompt: "Enter the Master Node IP address"
+      private: no
+
+    - name: master_hostname
+      prompt: "Enter the Master Node hostname"
+      private: no
+
+    - name: master_interface
+      prompt: "Enter the network interface used for DHCP (e.g., ens37)"
+      private: no
+
+    - name: iso_path
+      prompt: "Enter full path to AlmaLinux 8 ISO (e.g., /root/AlmaLinux-8.9-x86_64-dvd.iso)"
+      private: no
+
+    - name: compute_nodes
+      prompt: |
+        Enter compute node definitions in CSV format:
+        hostname,ip,mac
+        Example: cn00,192.168.20.12,00:0c:29:c4:50:25;cn01,192.168.20.13,00:0c:29:c4:50:26
+      private: no
+
+    - name: netboot_type
+      prompt: "Enter netboot type (xnba for UEFI, pxelinux for BIOS)"
+      private: no
+
+    - name: dhcp_start_range
+      prompt: "Enter the start IP of the DHCP range (e.g., 192.168.1.10)"
+      private: no
+
+    - name: dhcp_end_range
+      prompt: "Enter the end IP of the DHCP range (e.g., 192.168.1.20)"
+      private: no
+
+  vars:
+    domain: cdac.in
+    osimage: alma8.9-x86_64-netboot-compute
+    chroot_dir: "/install/netboot/almalinux8.9/x86_64/compute/rootimg"
+
+  tasks:
+    - name: Parse and sanitize compute node list
+      set_fact:
+        compute_list: >-
+          {{
+            compute_nodes.split(';') |
+            map('split', ',') |
+            map('map', 'trim') |
+            list
+          }}
+
+    - name: Ensure /etc/hosts entry exists for master
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ master_ip }} {{ master_hostname }} {{ master_hostname }}.{{ domain }}"
+        state: present
+
+    - name: Install required base packages
+      dnf:
+        name:
+          - epel-release
+          - yum-utils
+          - wget
+        state: present
+        update_cache: true
+
+    - name: Add xCAT core repo
+      get_url:
+        url: "https://xcat.org/files/xcat/repos/yum/latest/xcat-core/xcat-core.repo"
+        dest: /etc/yum.repos.d/xcat-core.repo
+        mode: '0644'
+
+    - name: Add xCAT dep repo
+      get_url:
+        url: "https://xcat.org/files/xcat/repos/yum/latest/xcat-dep/rh8/x86_64/xcat-dep.repo"
+        dest: /etc/yum.repos.d/xcat-dep.repo
+        mode: '0644'
+
+    - name: Install xCAT
+      dnf:
+        name: xCAT
+        state: present
+
+    - name: Source xCAT environment in profile
+      shell: bash /root/auto/xcat-profile.sh
+      args:
+        executable: /bin/bash
+
+    - name: Run xcatconfig
+      shell: |
+        source /etc/profile.d/xcat.sh
+        xcatconfig -f
+      args:
+        executable: /bin/bash
+
+    - name: Start and enable xcatd service
+      service:
+        name: xcatd
+        state: started
+        enabled: true
+
+    - name: Mount ISO image
+      ansible.posix.mount:
+        src: "{{ iso_path }}"
+        path: /mnt/alma
+        fstype: iso9660
+        opts: loop,ro
+        state: mounted
+
+    - name: Copy ISO with copycds
+      shell: |
+        source /etc/profile.d/xcat.sh
+        copycds {{ iso_path }}
+      args:
+        executable: /bin/bash
+        creates: "/install/almalinux8.9/x86_64"
+
+    - name: Configure DHCP interface in xCAT
+      shell: |
+        source /etc/profile.d/xcat.sh
+        chdef -t site dhcpinterfaces="{{ master_hostname }}|{{ master_interface }}"
+      args:
+        executable: /bin/bash
+
+    - name: Set master IP in xCAT
+      shell: |
+        source /etc/profile.d/xcat.sh
+        chdef -t site master={{ master_ip }}
+      args:
+        executable: /bin/bash
+
+    - name: Set domain in xCAT
+      shell: |
+        source /etc/profile.d/xcat.sh
+        chdef -t site domain={{ domain }}
+      args:
+        executable: /bin/bash
+
+    - name: Check if osimage exists
+      shell: |
+        source /etc/profile.d/xcat.sh
+        lsdef -t osimage {{ osimage }}
+      register: osimage_check
+      failed_when: false
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    - name: Create osimage definition file
+      copy:
+        dest: "/tmp/{{ osimage }}.def"
+        content: |
+          object={{ osimage }}
+          class=osimage
+          type=linux
+          provmethod=netboot
+          profile=compute
+          osname=alma
+          osver=8.9
+          arch=x86_64
+          distribution=almalinux8.9-x86_64
+      when: osimage_check.rc != 0
+
+    - name: Register osimage
+      shell: |
+        source /etc/profile.d/xcat.sh
+        mkdef -z < /tmp/{{ osimage }}.def
+      when: osimage_check.rc != 0
+      args:
+        executable: /bin/bash
+
+    - name: Generate netboot image
+      shell: |
+        source /etc/profile.d/xcat.sh
+        genimage {{ osimage }}
+      args:
+        executable: /bin/bash
+        creates: "{{ chroot_dir }}"
+
+    - name: Create synclist directory
+      file:
+        path: /install/custom/netboot
+        state: directory
+        mode: '0755'
+
+    - name: Create compute.synclist
+      copy:
+        dest: /install/custom/netboot/compute.synclist
+        content: |
+          /etc/passwd -> /etc/passwd
+          /etc/group -> /etc/group
+          /etc/shadow -> /etc/shadow
+
+    - name: Register synclist
+      shell: |
+        source /etc/profile.d/xcat.sh
+        chdef -t osimage -o {{ osimage }} synclists="/install/custom/netboot/compute.synclist"
+      args:
+        executable: /bin/bash
+
+    - name: Pack netboot image
+      shell: |
+        source /etc/profile.d/xcat.sh
+        packimage {{ osimage }}
+      args:
+        executable: /bin/bash
+        creates: "{{ chroot_dir }}/.profile"
+
+    - name: Define compute nodes
+      loop: "{{ compute_list }}"
+      loop_control:
+        loop_var: node
+      shell: |
+        source /etc/profile.d/xcat.sh
+        if ! lsdef {{ node[0] }} > /dev/null 2>&1; then
+          mkdef -t node -o {{ node[0] }} \
+            groups=compute \
+            ip={{ node[1] }} \
+            mac={{ node[2] }} \
+            netboot={{ netboot_type }} \
+            os=alma8.9 \
+            arch=x86_64 \
+            profile=compute
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Set provisioning method for compute group
+      shell: |
+        source /etc/profile.d/xcat.sh
+        chdef -t group compute provmethod={{ osimage }}
+      args:
+        executable: /bin/bash
+
+    - name: Add DHCP range to xCAT site definition
+      shell: |
+        source /etc/profile.d/xcat.sh
+        chdef -t site dhcprange={{ dhcp_start_range }}-{{ dhcp_end_range }}
+      args:
+        executable: /bin/bash
+
+    - name: Generate DHCP, DNS and networks
+      shell: |
+        source /etc/profile.d/xcat.sh
+        makenetworks
+        makedns -n
+        makedhcp -n
+        makedhcp -a
+      args:
+        executable: /bin/bash
+
+    - set_fact:
+        dhcpd_conf_path: "/etc/dhcp/dhcpd.conf"
+
+    - name: Add DHCP range to dhcpd.conf manually
+      ansible.builtin.lineinfile:
+         path: "{{ dhcpd_conf_path }}"
+         regexp: '^(\s*option cumulus-provision-url.*)$'
+         line: '    range {{ dhcp_start_range }} {{ dhcp_end_range }};'
+         insertafter: '^(\s*option cumulus-provision-url.*);$'
+         state: present
+         backup: yes
+         notify: Restart dhcpd service
+
+    - name: Restart dhcpd service
+      systemd:
+        name: dhcpd
+        state: restarted
+        enabled: yes
+
+    - name: Restart xcatd service
+      systemd:
+        name: xcatd
+        state: restarted
+
+    - name: Display all defined osimages (for verification)
+      shell: |
+        source /etc/profile.d/xcat.sh
+        lsdef -t osimage
+      register: osimages_output
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    - debug:
+        var: osimages_output.stdout_lines
+
+    - name: Set netboot type for each compute node
+      loop: "{{ compute_list }}"
+      loop_control:
+        loop_var: node
+      shell: |
+        source /etc/profile.d/xcat.sh
+        chdef {{ node[0] }} netboot={{ netboot_type }}
+      args:
+        executable: /bin/bash
+
+    - name: Set MAC address for each compute node (if not already set or needs update)
+      loop: "{{ compute_list }}"
+      loop_control:
+        loop_var: node
+      shell: |
+        source /etc/profile.d/xcat.sh
+        chdef {{ node[0] }} mac={{ node[2] }}
+      args:
+        executable: /bin/bash
+
+    - name: Set osimage for each compute node
+      loop: "{{ compute_list }}"
+      loop_control:
+        loop_var: node
+      shell: |
+        source /etc/profile.d/xcat.sh
+        nodeset {{ node[0] }} osimage={{ osimage }}
+      args:
+        executable: /bin/bash
