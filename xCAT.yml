@@ -266,7 +266,7 @@
          insertafter: '^(\s*option cumulus-provision-url.*);$'
          state: present
          backup: yes
-         notify: Restart dhcpd service
+        
 
     - name: Restart dhcpd service
       systemd:
